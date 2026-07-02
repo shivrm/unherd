@@ -2,46 +2,14 @@ import torch
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
+import scipy.sparse as sp
 
 import os
 import requests
 import zipfile
 
-class BPRDataset(Dataset):
-    def __init__(self, df, num_items, num_negatives=1):
-        self.users = df['user_idx'].values
-        self.positive_items = df['item_idx'].values
-        self.num_items = num_items
-        self.num_negatives = num_negatives
 
-        # Create a set of (user, item) pairs for efficient lookup during negative sampling
-        self.user_item_interactions = df.groupby('user_idx')['item_idx'].apply(set).to_dict()
-
-    def __len__(self):
-        return len(self.users)
-
-    def __getitem__(self, idx):
-        user_idx = self.users[idx]
-        positive_item_idx = self.positive_items[idx]
-
-        # Sample negative items
-        negative_item_idx = self._sample_negative(user_idx)
-
-        return (
-            torch.tensor(user_idx, dtype=torch.long),
-            torch.tensor(positive_item_idx, dtype=torch.long),
-            torch.tensor(negative_item_idx, dtype=torch.long)
-        )
-
-    def _sample_negative(self, user_idx):
-        user_positive_items = self.user_item_interactions.get(user_idx, set())
-        while True:
-            negative_item = np.random.randint(0, self.num_items)
-            if negative_item not in user_positive_items:
-                return negative_item
-            
-
-class MACRDataset(Dataset):
+class BCEDataset(Dataset):
     def __init__(self, df):
         self.users = df['user_idx'].values
         self.items = df['item_idx'].values
@@ -56,6 +24,36 @@ class MACRDataset(Dataset):
             torch.tensor(self.items[idx], dtype=torch.long),
             torch.tensor(self.labels[idx], dtype=torch.float)
         )
+
+
+class BPRDataset(Dataset):
+    def __init__(self, df, num_items):
+        self.num_items = num_items
+        self.pos_df = df[df["binary_rating"] == 1].copy()
+        self.users = self.pos_df['user_idx'].values
+        self.pos_items = self.pos_df["item_idx"].values
+        self.pos_interactions = self.pos_df.groupby("user_idx")["item_idx"].apply(set).to_dict()
+
+    def __len__(self):
+        return len(self.users)
+
+    def __getitem__(self, idx):
+        user = self.users[idx]
+        pos_item = self.pos_items[idx]
+        neg_item = self._sample_negative(user)
+
+        return (
+            torch.tensor(user, dtype=torch.long),
+            torch.tensor(pos_item, dtype=torch.long),
+            torch.tensor(neg_item, dtype=torch.long)
+        )
+
+    def _sample_negative(self, user_idx):
+        pos_items = self.pos_interactions.get(user_idx, set())
+        while True:
+            item = np.random.randint(0, self.num_items)
+            if item not in pos_items:
+                return item
 
 
 def balance_test_set(df, max_interactions=20):
@@ -99,11 +97,13 @@ def load_movielens(path, train_frac=0.8):
 
     # Map user IDs to consecurive numbers
     user_ids = ratings_df['user_id'].unique().tolist()
+    num_users = len(user_ids)
     user_to_idx = {user_id: idx for idx, user_id in enumerate(user_ids)}
     ratings_df['user_idx'] = ratings_df['user_id'].map(user_to_idx)
 
     # Map item IDs to consecurive numbers
     item_ids = ratings_df['item_id'].unique().tolist()
+    num_items = len(item_ids)
     item_to_idx = {item_id: idx for idx, item_id in enumerate(item_ids)}
     ratings_df['item_idx'] = ratings_df['item_id'].map(item_to_idx)
 
@@ -116,4 +116,33 @@ def load_movielens(path, train_frac=0.8):
     train_df = ratings_df.iloc[:split_idx]
     test_df = ratings_df.iloc[split_idx:]
 
-    return train_df, test_df
+    return num_users, num_items, train_df, test_df
+
+def compute_normalized_adj(train_df, num_users, num_items): 
+    # Interaction matrix
+    R_sparse = sp.csr_matrix((np.ones_like(train_df['user_idx'], dtype=np.float32),
+                            (train_df['user_idx'], train_df['item_idx'])),
+                            shape=(num_users, num_items))
+
+    # Adjacency matrix
+    adj = sp.bmat([[sp.csr_matrix((num_users, num_users)), R_sparse],
+                [R_sparse.transpose(), sp.csr_matrix((num_items, num_items))]],
+                format='csr')
+
+    # Degree matrix D and its inverse square root
+    rowsum = np.array(adj.sum(axis=1))
+    d_inv_sqrt = np.power(rowsum, -0.5).flatten()
+    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+    D_inv_sqrt = sp.diags(d_inv_sqrt)
+
+    # Normalized adjacency matrix A_hat = D^{-1/2} A D^{-1/2}
+    adj_normalized = D_inv_sqrt.dot(adj).dot(D_inv_sqrt).tocoo()
+
+    # Convert to PyTorch sparse tensor
+    row = torch.tensor(adj_normalized.row, dtype=torch.long)
+    col = torch.tensor(adj_normalized.col, dtype=torch.long)
+    index = torch.stack([row, col])
+    data = torch.tensor(adj_normalized.data, dtype=torch.float)
+    adj_normalized_torch = torch.sparse_coo_tensor(index, data, adj_normalized.shape)
+
+    return adj_normalized_torch

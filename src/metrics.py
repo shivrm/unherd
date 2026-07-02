@@ -55,8 +55,8 @@ class MetricsCalculator:
 
         # Identify long-tail items
         item_ids = set(train_df['item_id'].unique().tolist() + test_df['item_id'].unique().tolist())
-        num_items = len(item_ids)
-        item_indices = np.arange(num_items)
+        self.num_items = len(item_ids)
+        item_indices = np.arange(self.num_items)
         popularity_list = pd.Series(self.item_popularity).reindex(item_indices, fill_value=0)
         items_sorted = popularity_list.sort_values(ascending=True)
         lt_threshold_idx = int(len(items_sorted) * 0.8)
@@ -67,7 +67,7 @@ class MetricsCalculator:
         self.train_user_items = self.train_df.groupby("user_idx")["item_idx"].apply(list).to_dict()
         self.train_user_ratings = self.train_df.groupby("user_idx")["rating"].apply(list).to_dict()
 
-        self.item_to_group = self.build_popularity_groups(num_items, popularity_list)
+        self.item_to_group = self.build_popularity_groups(self.num_items, popularity_list)
 
     def get_topk_recs(self, user_idx, k=20):
         seen_items = self.train_interactions.get(user_idx, set())
@@ -152,7 +152,7 @@ class MetricsCalculator:
 
         aplts = []
         for user_idx in self.test_df["user_idx"].unique():
-            recs = self._get_top_k_recommendations(user_idx, k)
+            recs = self.get_topk_recs(user_idx, k)
             if not recs:
                 continue
 
@@ -167,7 +167,7 @@ class MetricsCalculator:
 
         unique_tail_items = set()
         for user_idx in self.test_df["user_idx"].unique():
-            recs = self._get_top_k_recommendations(user_idx, k)
+            recs = self.get_topk_recs(user_idx, k)
             for item in recs:
                 if item in self.long_tail_indices:
                     unique_tail_items.add(item)
@@ -191,12 +191,12 @@ class MetricsCalculator:
             if not hist_items:
                 continue
 
-            recs = self._get_top_k_recommendations(user_idx, k)
+            recs = self.get_topk_recs(user_idx, k)
             if not recs:
                 continue
 
-            P = self._calculate_propensity(hist_items, self.item_to_group, self.num_groups, hist_ratings)
-            Q = self._calculate_propensity(recs, self.item_to_group, self.num_groups)
+            P = self.calculate_propensity(hist_items, self.item_to_group, 3, hist_ratings)
+            Q = self.calculate_propensity(recs, self.item_to_group, 3)
 
             js_dist = jensenshannon(P, Q)
             upd_scores.append(js_dist ** 2)
